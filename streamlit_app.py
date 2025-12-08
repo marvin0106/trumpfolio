@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import plotly.express as px
 
 # --- Imports und Setup ---
 try:
-    from pypfopt import risk_models, EfficientFrontier, black_litterman
+    from pypfopt import risk_models, EfficientFrontier, black_litterman, objective_functions
 except ImportError:
     st.error("Fehler: 'PyPortfolioOpt' fehlt. Bitte pip install PyPortfolioOpt ausführen.")
     st.stop()
@@ -42,7 +43,7 @@ def load_data_file(key, uploaded_file=None):
             
     return df
 
-# --- Sidebar: Daten Laden ---
+# --- Sidebar: Daten laden ---
 st.sidebar.header("1. Datenquellen")
 dfs = {}
 
@@ -60,60 +61,71 @@ for key, conf in FILES_CONFIG.items():
 
 st.sidebar.markdown("---")
 st.sidebar.header("2. Globale Parameter")
-risk_free_rate = st.sidebar.number_input("Risk Free Rate", value=0.02, step=0.005, format="%.3f")
+risk_free_rate = st.sidebar.number_input("Risk Free Rate (Rf)", value=0.02, step=0.005, format="%.3f")
 threshold_es = st.sidebar.slider("Emissions-Score Threshold (Quantil)", 0.1, 0.9, 0.3, 0.05)
 
 
-# --- Kern-Logik (Filter & Optimierung) ---
+# --- NEU: Sidebar Constraints ---
+st.sidebar.markdown("---")
+st.sidebar.header("3. Portfolio Beschränkungen")
 
-def get_filtered_universe_and_regions(df_desc, thresh_quantile):
-    """
-    1. Filtert das Universum exakt wie im Notebook (Sin-Subset Quantil).
-    2. Erstellt zusätzlich ein Mapping {ISIN: Region} für die Constraints.
-    """
+# A. Max Weight per Asset
+max_weight_asset = st.sidebar.slider(
+    "Max. Allokation pro Aktie", 
+    min_value=0.05, max_value=1.0, value=1.0, step=0.05,
+    help="Wie viel Prozent darf eine einzelne Aktie maximal einnehmen?"
+)
+
+# B. Regionen Constraints (Dynamisch)
+region_constraints = {}
+available_regions = []
+
+if dfs["desc"] is not None:
+    # Wir holen uns die Regionen aus dem Datensatz, um die Slider zu bauen
+    # Achtung: Wir nehmen hier alle Regionen, auch wenn sie nachher evtl. rausgefiltert werden
+    available_regions = dfs["desc"]['RegionofHeadquarters'].dropna().unique()
+    available_regions = sorted([str(x) for x in available_regions])
+
+    with st.sidebar.expander("🌍 Regionale Limits (Min/Max)", expanded=False):
+        st.caption("Lege fest, wie viel % des Portfolios aus einer Region kommen muss/darf.")
+        for reg in available_regions:
+            # Slider liefert Tuple (min, max)
+            # Default: (0.0, 1.0) also keine Einschränkung
+            c_min, c_max = st.slider(f"{reg}", 0.0, 1.0, (0.0, 1.0), step=0.05)
+            
+            # Wir speichern nur Beschränkungen, die vom Standard (0,1) abweichen
+            if c_min > 0.0 or c_max < 1.0:
+                region_constraints[reg] = (c_min, c_max)
+
+# --- Logik Funktionen ---
+
+def get_filtered_universe(df_desc, thresh_quantile):
+    """Logik analog Notebook V2."""
     df_clean = df_desc.copy()
-    
-    # Cleaning wie im Notebook Zelle 4
-    df_clean = df_clean.dropna(subset=['EmissionsScore', 'SinRevenue', 'RegionofHeadquarters'])
+    df_clean = df_clean.dropna(subset=['EmissionsScore', 'SinRevenue'])
     df_clean['SinRevenue'] = pd.to_numeric(df_clean['SinRevenue'], errors='coerce')
     
-    # Filter: SinRevenue == 1
     df_sin = df_clean[df_clean['SinRevenue'] == 1]
-    
-    # Threshold auf dem SIN-Subset berechnen (Notebook Logik)
     thresh_val = df_sin['EmissionsScore'].quantile(thresh_quantile)
-    
-    # Finaler Cut
     df_final = df_sin[df_sin['EmissionsScore'] <= thresh_val]
     
-    # ISIN Liste
-    valid_isins = [str(x).strip() for x in df_final['isin'].unique()]
-    
-    # Regionen Mapping erstellen (ISIN -> Region)
-    # Da Panel-Daten vorliegen, nehmen wir den letzten verfügbaren Eintrag pro ISIN
-    df_unique_meta = df_final.drop_duplicates(subset=['isin'], keep='last')
-    region_map = pd.Series(df_unique_meta.RegionofHeadquarters.values, index=df_unique_meta.isin).to_dict()
-    
-    # Liste aller verfügbaren Regionen für die Sidebar
-    available_regions = sorted(list(set(region_map.values())))
-    
-    return valid_isins, region_map, available_regions
+    valid_isins = df_final['isin'].unique()
+    valid_isins = [str(x).strip() for x in valid_isins] 
+    return valid_isins
 
-def optimize_portfolio(df_ret, df_mkt, valid_isins, rf, region_limits, region_mapper, max_single_weight):
+def optimize_portfolio(df_ret, df_mkt, df_desc, valid_isins, rf, max_single_weight, region_limits):
     """
-    Führt Black-Litterman und Mean-Variance Optimierung durch.
-    Beachtet dabei regionale Constraints und max. Einzelgewichtung.
+    Erweitert um Constraints und Mapping für Regionen.
     """
-    
-    # --- 1. Vorbereitung Gesamtmarkt (BL) ---
+    # 1. Datenvorbereitung (Notebook Logik)
     common_index = df_ret.columns.intersection(df_mkt.index)
-    if len(common_index) < 10: return None, "Zu wenig Übereinstimmungen (Returns <-> Market)."
+    if len(common_index) < 10:
+        return None, "Zu wenig Übereinstimmungen Datasets.", None
 
     mkt_returns_sync = df_ret[common_index]
     mkt_caps = df_mkt.loc[common_index, 'Mcap']
     w_mkt = mkt_caps / mkt_caps.sum()
     
-    # Marktparameter berechnen
     weighted_returns = mkt_returns_sync.mul(w_mkt, axis=1)
     market_return_series = weighted_returns.sum(axis=1)
     
@@ -123,7 +135,6 @@ def optimize_portfolio(df_ret, df_mkt, valid_isins, rf, region_limits, region_ma
     
     cov_matrix_market = mkt_returns_sync.cov() * 252
     
-    # BL Prior Returns
     prior_returns = black_litterman.market_implied_prior_returns(
         market_caps=w_mkt,
         risk_aversion=delta,
@@ -131,163 +142,159 @@ def optimize_portfolio(df_ret, df_mkt, valid_isins, rf, region_limits, region_ma
         risk_free_rate=rf
     )
     
-    # --- 2. Reduktion auf Sin-Universum ---
-    available_isins = [i for i in valid_isins if i in df_ret.columns]
-    final_universe = [i for i in available_isins if i in prior_returns.index]
+    # 2. Filter Sin-Universe
+    available_isins = [isin for isin in valid_isins if isin in df_ret.columns]
+    final_universe = [isin for isin in available_isins if isin in prior_returns.index]
     
-    if len(final_universe) == 0: return None, "Keine Aktien nach Schnittmenge übrig."
+    if len(final_universe) == 0:
+        return None, "Keine Aktien im Universum übrig.", None
 
     er_filtered = prior_returns.loc[final_universe]
     returns_filtered = df_ret[final_universe]
     
-    # Cleaning für Matrix
+    # Cleaning
     returns_safe = returns_filtered.astype('float64').clip(lower=-0.9, upper=5.0).fillna(0.0)
-    
-    # Sync Indizes
     common_idx = er_filtered.index.intersection(returns_safe.columns)
     er_final = er_filtered.loc[common_idx]
     returns_final = returns_safe[common_idx]
     
-    # Kovarianzmatrix
+    # Kovarianz
     try:
         cov_matrix_final = risk_models.CovarianceShrinkage(returns_final).ledoit_wolf()
     except:
-        cov_matrix_final = risk_models.fix_nonpositive_semidefinite(returns_final.cov() * 252)
+        cov_matrix_temp = returns_final.cov() * 252
+        cov_matrix_final = risk_models.fix_nonpositive_semidefinite(cov_matrix_temp)
         
     # --- 3. Optimierung mit Constraints ---
     
-    # Wir setzen weight_bounds=(0, max_single_weight) -> Keine Shortpositionen, Max Gewicht pro Aktie
+    # Bounds: (0, max_single_weight) für jede Aktie
+    # Standard ist (0, 1)
     ef = EfficientFrontier(er_final, cov_matrix_final, weight_bounds=(0, max_single_weight))
     
-    # Regionale Constraints hinzufügen
-    # PyPortfolioOpt braucht einen Mapper, der nur die Assets im finalen Universum enthält
-    # Wir filtern den globalen region_mapper auf die finalen ISINs
-    final_region_mapper = {isin: region_mapper.get(isin, "Other") for isin in er_final.index}
-    
-    # Wir müssen prüfen, ob Limits verletzt werden könnten (z.B. wenn Limit < Summe der Min-Weights)
-    # Hier nehmen wir Sector Constraints
-    # Achtung: Wenn ein Limit auf 0 gesetzt wird, fliegt der Sektor raus.
-    
-    # Erstelle das Limits-Dictionary für PyPortfolioOpt
-    # Format: {'Asia': 0.5, 'Europe': 0.3}
-    active_sector_limits = {reg: lim for reg, lim in region_limits.items() if reg in list(final_region_mapper.values())}
-    
-    # Constraints anwenden
-    if active_sector_limits:
-        ef.add_sector_constraints(final_region_mapper, active_sector_limits)
+    # Regionen Constraints anwenden
+# Regionen Constraints anwenden
+    if region_limits:
+        # 1. Mapping erstellen {ISIN: Region}
+        subset_desc = df_desc[df_desc['isin'].isin(common_idx)]
+        isin_region_map = subset_desc.drop_duplicates('isin').set_index('isin')['RegionofHeadquarters'].to_dict()
         
+        # Mapper für PyPortfolioOpt (Fallback "Other" falls Daten fehlen)
+        sector_mapper = {isin: isin_region_map.get(isin, "Other") for isin in common_idx}
+        
+        # 2. Limits aufsplitten in Lower und Upper Bounds
+        # PyPortfolioOpt braucht zwei getrennte Dicts: eins für Min, eins für Max
+        sector_lower = {reg: limits[0] for reg, limits in region_limits.items()}
+        sector_upper = {reg: limits[1] for reg, limits in region_limits.items()}
+        
+        # 3. Constraints hinzufügen
+        # Hier übergeben wir jetzt explizit (Mapper, Lower, Upper)
+        ef.add_sector_constraints(sector_mapper, sector_lower, sector_upper)
+
     try:
+        # Hier lag evtl. der Unterschied: Notebook nutzt ef.max_sharpe() ohne args -> nutzt default rf
+        # Wir nutzen hier explizit rf, um konsistent zu sein. 
+        # Wenn wir das Notebook replizieren wollen: dort wurde rf=0.02 in Variable gesetzt.
         weights = ef.max_sharpe(risk_free_rate=rf)
         cleaned_weights = ef.clean_weights()
+        
+        # Performance holen
+        # Notebook output zeigt Sharpe 1.10. (15.6 - 0) / 14.2 = 1.10
+        # Das bedeutet, das Notebook hat für die ANZEIGE (display) rf=0.0 genutzt.
         perf = ef.portfolio_performance(verbose=False, risk_free_rate=rf)
-        return cleaned_weights, perf
+        
+        return cleaned_weights, perf, sector_mapper if region_limits else None
+        
     except Exception as e:
-        return None, f"Optimierung fehlgeschlagen (Constraints zu strikt?): {str(e)}"
+        return None, f"Optimierung gescheitert. Sind die Constraints möglich?\nFehler: {str(e)}", None
 
 
-# --- UI Logik ---
+# --- Main UI ---
 
 if all(df is not None for df in dfs.values()):
-    
-    # 1. Daten vorverarbeiten um Regionen zu erhalten
-    valid_isins, region_map, available_regions = get_filtered_universe_and_regions(dfs["desc"], threshold_es)
-    
-    # --- Sidebar: Constraints ---
-    st.sidebar.markdown("---")
-    st.sidebar.header("3. Constraints (Regeln)")
-    
-    # A. Einzelaktien Limit
-    max_single_asset = st.sidebar.slider(
-        "Max. Gewichtung pro Aktie", 
-        min_value=0.05, max_value=1.0, value=1.0, step=0.05,
-        help="Keine einzelne Aktie darf mehr als diesen Prozentsatz ausmachen."
-    )
-    
-    # B. Regionale Limits
-    st.sidebar.subheader("Max. Allokation nach Region")
-    region_limits = {}
-    
-    # Expander für Ordnung
-    with st.sidebar.expander("Regionale Limits anpassen", expanded=True):
-        for region in available_regions:
-            # Default 1.0 = 100% erlaubt (keine Einschränkung)
-            val = st.slider(f"{region}", 0.0, 1.0, 1.0, 0.05)
-            region_limits[region] = val
-
-    # --- Hauptbereich ---
-
-    if st.button("🚀 Kalkulation starten", type="primary"):
-        with st.spinner("Optimiere Portfolio..."):
+    if st.button("🚀 Kalkulation starten"):
+        with st.spinner("Berechne Portfolio..."):
             
-            # Apple Check
+            # 1. Filter
+            valid_isins = get_filtered_universe(dfs["desc"], threshold_es)
+            
             if "US0378331005" in valid_isins:
-                st.error("🚨 ALARM: Apple ist fälschlicherweise im Datensatz!")
+                st.error("🚨 ALARM: Apple ist im Filter!")
             else:
-                # Optimierung aufrufen
-                res, perf = optimize_portfolio(
-                    dfs["returns"], dfs["market"], valid_isins, risk_free_rate, 
-                    region_limits, region_map, max_single_asset
+                # 2. Optimize
+                res, perf, mapper = optimize_portfolio(
+                    dfs["returns"], 
+                    dfs["market"], 
+                    dfs["desc"], # Übergeben für Regionen-Mapping
+                    valid_isins, 
+                    risk_free_rate,
+                    max_weight_asset,
+                    region_constraints
                 )
                 
                 if res is None:
-                    st.error(perf) # Fehlermeldung anzeigen
+                    st.error(perf) # Fehler anzeigen
                 else:
-                    # --- Ergebnisse Anzeigen (UX) ---
+                    # --- DASHBOARD ---
+                    st.success("Optimierung erfolgreich!")
                     
-                    # 1. Performance KPIs
-                    st.markdown("### 📊 Portfolio Performance")
-                    kpi1, kpi2, kpi3 = st.columns(3)
-                    kpi1.metric("Erwartete Rendite (p.a.)", f"{perf[0]:.2%}")
-                    kpi2.metric("Volatilität (p.a.)", f"{perf[1]:.2%}")
-                    kpi3.metric("Sharpe Ratio", f"{perf[2]:.2f}")
-                    
-                    st.divider()
-                    
-                    # Datenaufbereitung für Tabelle & Stats
+                    # 1. KPIs
+                    # Umwandeln in DataFrame
                     df_w = pd.DataFrame.from_dict(res, orient='index', columns=['Weight'])
-                    # Filter auf relevante Positionen
-                    portfolio_active = df_w[df_w['Weight'] > 0.0001].copy()
-                    portfolio_active = portfolio_active.sort_values('Weight', ascending=False)
+                    # Nur echte Positionen
+                    df_active = df_w[df_w['Weight'] > 0.0001].copy()
                     
-                    # Region hinzufügen zur Tabelle
-                    portfolio_active['Region'] = portfolio_active.index.map(region_map)
+                    # Merge mit Meta-Daten (Regionen) für Anzeige
+                    # Wir brauchen ein sauberes ISIN -> Region Mapping
+                    meta_clean = dfs["desc"].drop_duplicates('isin').set_index('isin')[['RegionofHeadquarters', 'TRBCBusinessSectorName', 'CountryofHeadquarters']]
+                    df_display = df_active.join(meta_clean, how='left')
                     
-                    # 2. Portfolio Statistiken (User Wunsch)
-                    st.markdown("### 🧩 Portfolio Zusammensetzung")
+                    # KPI Row
+                    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+                    kpi1.metric("Anzahl Aktien", len(df_active))
+                    kpi2.metric("Max Allokation", f"{df_active['Weight'].max():.2%}", df_active['Weight'].idxmax())
+                    kpi3.metric("Min Allokation", f"{df_active['Weight'].min():.2%}", df_active['Weight'].idxmin())
+                    kpi4.metric("Sharpe Ratio", f"{perf[2]:.2f}")
                     
-                    stat1, stat2, stat3, stat4 = st.columns(4)
+                    st.markdown("---")
                     
-                    # Anzahl
-                    count = len(portfolio_active)
-                    stat1.metric("Anzahl Aktien", count)
+                    # 2. Charts & Tables (Layout 2 Spalten)
+                    col_left, col_right = st.columns([1, 1])
                     
-                    # Max Allokation
-                    if not portfolio_active.empty:
-                        max_stock = portfolio_active['Weight'].idxmax()
-                        max_val = portfolio_active['Weight'].max()
-                        stat2.metric("Größte Position", f"{max_val:.2%}", help=max_stock)
+                    with col_left:
+                        st.subheader("🏆 Top 10 Positionen")
+                        top10 = df_display.sort_values('Weight', ascending=False).head(10)
                         
-                        min_stock = portfolio_active['Weight'].idxmin()
-                        min_val = portfolio_active['Weight'].min()
-                        stat3.metric("Kleinste Position", f"{min_val:.2%}", help=min_stock)
+                        # Schöne Tabelle
+                        st.dataframe(
+                            top10[['Weight', 'RegionofHeadquarters', 'CountryofHeadquarters']].style.format({'Weight': '{:.2%}'}),
+                            use_container_width=True
+                        )
                         
-                        # Summe (Check)
-                        stat4.metric("Investitionsquote", f"{portfolio_active['Weight'].sum():.1%}")
-                    
-                    # 3. Top 10 Tabelle
-                    st.subheader("🏆 Top 10 Positionen")
-                    
-                    top10 = portfolio_active.head(10)
-                    
-                    # Styling der Tabelle
-                    st.dataframe(
-                        top10.style.format({'Weight': '{:.2%}'}).background_gradient(subset=['Weight'], cmap="Greens"),
-                        use_container_width=True
-                    )
-                    
-                    # 4. Volle Liste im Expander
-                    with st.expander("Vollständige Positionsliste anzeigen"):
-                        st.dataframe(portfolio_active.style.format({'Weight': '{:.4f}'}), use_container_width=True)
+                        st.markdown(f"**Gesamtrendite (Exp.):** {perf[0]:.2%}")
+                        st.markdown(f"**Volatilität:** {perf[1]:.2%}")
+
+                    with col_right:
+                        st.subheader("🌍 Regionale Verteilung")
+                        
+                        if not df_display.empty:
+                            # Group by Region
+                            df_region = df_display.groupby('RegionofHeadquarters')['Weight'].sum().reset_index()
+                            
+                            fig = px.pie(
+                                df_region, 
+                                values='Weight', 
+                                names='RegionofHeadquarters', 
+                                title='Allocation by Region',
+                                hole=0.4,
+                                color_discrete_sequence=px.colors.qualitative.Pastel
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.warning("Keine Positionen.")
+
+                    # 3. Alle Positionen (Expander)
+                    with st.expander("Vollständiges Portfolio ansehen"):
+                        st.dataframe(df_display.sort_values('Weight', ascending=False).style.format({'Weight': '{:.4%}'}))
 
 else:
-    st.info("👋 Willkommen! Bitte lade links deine Excel-Dateien hoch oder lege sie in den 'data' Ordner.")
+    st.info("Bitte lade alle Dateien hoch oder platziere sie im 'data' Ordner.")
