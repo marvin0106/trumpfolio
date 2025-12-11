@@ -271,7 +271,7 @@ if all(df is not None for df in dfs.values()):
                         'Phase': [
                             '1. Gesamtmarkt', 
                             '2. Nach Nachhaltigkeits-Filter', 
-                            '3. Mit Rendite-Daten (Quality Check)', 
+                            '3. Mit Rendite-Daten (Rendite-Match)', 
                             '4. Finales Portfolio'
                         ],
                         'Anzahl': [count_total, count_filtered, count_data, count_final]
@@ -321,24 +321,34 @@ if all(df is not None for df in dfs.values()):
                     # DATEN-MERGE & VISUALISIERUNG
                     # ---------------------------------------------------------
 
-                    # Merge mit Meta-Daten (Regionen & Sektoren) für Anzeige
-                    # WICHTIG: Hier 'TRBCBusinessSectorName' explizit mit auswählen!
-                    meta_cols = ['RegionofHeadquarters', 'TRBCBusinessSectorName', 'CountryofHeadquarters']
-                    
-                    # Wir holen Metadaten aus dem Descriptive File und entfernen Duplikate
+                    # 1. Metadaten (Sektoren/Regionen) aus dem Filter-Datensatz (desc)
+                    # Hier holen wir uns Sektor & Region
+                    meta_cols = ['RegionofHeadquarters', 'TRBCBusinessSectorName']
                     meta_clean = dfs["desc"].drop_duplicates('isin').set_index('isin')[meta_cols]
                     
-                    # Left Join: Portfolio-Daten mit Metadaten anreichern
+                    # 2. Joinen: Portfolio + Sektoren/Regionen
                     df_display = df_active.join(meta_clean, how='left')
                     
-                    # Fehlende Werte auffüllen (kosmetisch)
+                    # 3. Namen aus dem Markt-Datensatz (market) holen
+                    # Da dfs["market"] Querschnittsdaten sind (Index=ISIN), mappen wir direkt:
+                    df_display['Name'] = df_display.index.map(dfs["market"]['Name'])
+                    
+                    # Fallback: Wenn Name fehlt, nimm die ISIN
+                    df_display['Name'] = df_display['Name'].fillna(df_display.index)
+                    
+                    # Kosmetik für fehlende Werte
                     df_display['RegionofHeadquarters'] = df_display['RegionofHeadquarters'].fillna('Unknown')
                     df_display['TRBCBusinessSectorName'] = df_display['TRBCBusinessSectorName'].fillna('Other Sector')
 
-                    # KPI Row Anzeige
+                    # --- KPI REIHE ---
                     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
                     kpi1.metric("Anzahl Aktien", len(df_active))
-                    kpi2.metric("Max Allokation", f"{df_active['Weight'].max():.2%}", df_active['Weight'].idxmax())
+                    
+                    # Name der größten Position holen
+                    max_isin = df_active['Weight'].idxmax()
+                    max_name = df_display.loc[max_isin, 'Name']
+                    
+                    kpi2.metric("Max Allokation", f"{df_active['Weight'].max():.2%}", max_name)
                     kpi3.metric("Min Allokation", f"{df_active['Weight'].min():.2%}", df_active['Weight'].idxmin())
                     kpi4.metric("Sharpe Ratio", f"{perf[2]:.2f}")
                     
@@ -352,10 +362,16 @@ if all(df is not None for df in dfs.values()):
                         st.subheader("🏆 Top 10 Positionen")
                         top10 = df_display.sort_values('Weight', ascending=False).head(10)
                         
-                        # Tabelle anzeigen (mit Sektor Info für mehr Details)
+                        # Wir zeigen: Name, Gewicht, Sektor
+                        cols_show = ['Name', 'Weight', 'TRBCBusinessSectorName']
+                        
                         st.dataframe(
-                            top10[['Weight', 'TRBCBusinessSectorName', 'CountryofHeadquarters']].style.format({'Weight': '{:.2%}'}),
-                            use_container_width=True
+                            top10[cols_show].style.format({'Weight': '{:.2%}'}),
+                            use_container_width=True,
+                            column_config={
+                                "Name": st.column_config.TextColumn("Aktie", width="medium"),
+                                "TRBCBusinessSectorName": st.column_config.TextColumn("Sektor"),
+                            }
                         )
                         
                         st.caption(f"Gesamtrendite (Exp.): {perf[0]:.2%} | Volatilität: {perf[1]:.2%}")
@@ -365,39 +381,26 @@ if all(df is not None for df in dfs.values()):
                         st.subheader("📊 Portfolio Struktur")
                         
                         if not df_display.empty:
-                            # Tabs für saubere Trennung
                             tab_reg, tab_sec = st.tabs(["🌍 Regionen", "🏭 Sektoren"])
                             
-                            # --- TAB 1: REGIONEN ---
                             with tab_reg:
                                 df_region = df_display.groupby('RegionofHeadquarters')['Weight'].sum().reset_index()
                                 fig_reg = px.pie(
-                                    df_region, 
-                                    values='Weight', 
-                                    names='RegionofHeadquarters', 
-                                    hole=0.4,
+                                    df_region, values='Weight', names='RegionofHeadquarters', hole=0.4,
                                     color_discrete_sequence=px.colors.qualitative.Pastel
                                 )
-                                fig_reg.update_layout(margin=dict(t=20, b=20, l=20, r=20))
                                 st.plotly_chart(fig_reg, use_container_width=True)
 
-                            # --- TAB 2: SEKTOREN ---
                             with tab_sec:
                                 df_sector = df_display.groupby('TRBCBusinessSectorName')['Weight'].sum().reset_index()
-                                # Sortieren, damit die größten Sektoren oben stehen (für die Legende)
                                 df_sector = df_sector.sort_values('Weight', ascending=False)
-                                
                                 fig_sec = px.pie(
-                                    df_sector, 
-                                    values='Weight', 
-                                    names='TRBCBusinessSectorName', 
-                                    hole=0.4,
-                                    color_discrete_sequence=px.colors.qualitative.Set3 # Andere Farbpalette zur Unterscheidung
+                                    df_sector, values='Weight', names='TRBCBusinessSectorName', hole=0.4,
+                                    color_discrete_sequence=px.colors.qualitative.Set3
                                 )
-                                fig_sec.update_layout(margin=dict(t=20, b=20, l=20, r=20))
                                 st.plotly_chart(fig_sec, use_container_width=True)
                         else:
-                            st.warning("Keine Positionen für Diagramme.")
+                            st.warning("Keine Daten für Diagramme.")
 
                     # 3. Alle Positionen (Expander)
                     with st.expander("Vollständiges Portfolio ansehen"):
