@@ -191,15 +191,11 @@ def optimize_portfolio(df_ret, df_mkt, df_desc, valid_isins, rf, max_single_weig
         ef.add_sector_constraints(sector_mapper, sector_lower, sector_upper)
 
     try:
-        # Hier lag evtl. der Unterschied: Notebook nutzt ef.max_sharpe() ohne args -> nutzt default rf
-        # Wir nutzen hier explizit rf, um konsistent zu sein. 
-        # Wenn wir das Notebook replizieren wollen: dort wurde rf=0.02 in Variable gesetzt.
+        # Hier lag evtl. der Unterschied: Notebook nutzt ef.max_sharpe() ohne args -> nutzt default rf (0.02)
         weights = ef.max_sharpe(risk_free_rate=rf)
         cleaned_weights = ef.clean_weights()
         
-        # Performance holen
-        # Notebook output zeigt Sharpe 1.10. (15.6 - 0) / 14.2 = 1.10
-        # Das bedeutet, das Notebook hat für die ANZEIGE (display) rf=0.0 genutzt.
+        # Performance holen für Ausgabe im Dashboard
         perf = ef.portfolio_performance(verbose=False, risk_free_rate=rf)
         
         return cleaned_weights, perf, sector_mapper if region_limits else None
@@ -214,13 +210,14 @@ if all(df is not None for df in dfs.values()):
     if st.button("🚀 Kalkulation starten"):
         with st.spinner("Berechne Portfolio..."):
             
-            # 1. Filter
+            # 1. Filterung durchführen
             valid_isins = get_filtered_universe(dfs["desc"], threshold_es)
             
+            # Safety Check: Apple
             if "US0378331005" in valid_isins:
-                st.error("🚨 ALARM: Apple ist im Filter!")
+                st.error("🚨 ALARM: Apple ist im Filter enthalten! Die Filterlogik muss geprüft werden.")
             else:
-                # 2. Optimize
+                # 2. Optimierung starten
                 res, perf, mapper = optimize_portfolio(
                     dfs["returns"], 
                     dfs["market"], 
@@ -232,23 +229,113 @@ if all(df is not None for df in dfs.values()):
                 )
                 
                 if res is None:
-                    st.error(perf) # Fehler anzeigen
+                    st.error(perf) # Fehlermeldung aus der Funktion anzeigen
                 else:
-                    # --- DASHBOARD ---
+                    # --- DASHBOARD AUFBAU ---
                     st.success("Optimierung erfolgreich!")
                     
-                    # 1. KPIs
-                    # Umwandeln in DataFrame
+                    # Umwandeln in DataFrame für die Anzeige
                     df_w = pd.DataFrame.from_dict(res, orient='index', columns=['Weight'])
-                    # Nur echte Positionen
+                    # Nur echte Positionen behalten
                     df_active = df_w[df_w['Weight'] > 0.0001].copy()
                     
-                    # Merge mit Meta-Daten (Regionen) für Anzeige
-                    # Wir brauchen ein sauberes ISIN -> Region Mapping
-                    meta_clean = dfs["desc"].drop_duplicates('isin').set_index('isin')[['RegionofHeadquarters', 'TRBCBusinessSectorName', 'CountryofHeadquarters']]
+                    # ---------------------------------------------------------
+                    # 🧬 4-STUFEN FUNNEL VISUALISIERUNG (KORRIGIERT)
+                    # ---------------------------------------------------------
+                    st.markdown("### 🧬 Der Selektions-Trichter (Funnel)")
+                    
+                    # 1. Daten für die 4 Stufen berechnen
+                    
+                    # Stufe 1: Gesamtes Universum (aus Market File)
+                    # KORREKTUR: Zugriff auf dfs["market"] statt dfs["desc"]
+                    # Wir nehmen die Länge des Index (Annahme: 1 Zeile pro Aktie im Market File)
+                    count_total = len(dfs["market"])
+                    
+                    # Stufe 2: Nach Sin & ES Filter (Deine valid_isins aus dem Workshop File)
+                    count_filtered = len(valid_isins)
+                    
+                    # Stufe 3: Verfügbare Rendite-Daten (Match mit Returns File)
+                    isins_with_data = [i for i in valid_isins if i in dfs["returns"].columns]
+                    count_data = len(isins_with_data)
+                    
+                    # Stufe 4: Finales Portfolio (Gewichtung > 0)
+                    count_final = len(df_active)
+
+                    # --- CRITICAL CHECK (Sparring Partner) ---
+                    # Falls der Filter-Datensatz mehr Aktien hat als der Markt-Datensatz, stimmt was nicht.
+                    if count_filtered > count_total:
+                         st.warning(f"⚠️ **Daten-Inkonsistenz:** Dein gefiltertes Universum ({count_filtered}) ist größer als der Gesamtmarkt ({count_total}). Prüfe, ob 'market' und 'desc' zusammenpassen!")
+
+                    # 2. DataFrame für Plotly
+                    df_funnel = pd.DataFrame({
+                        'Phase': [
+                            '1. Gesamtmarkt', 
+                            '2. Nach Nachhaltigkeits-Filter', 
+                            '3. Mit Rendite-Daten (Quality Check)', 
+                            '4. Finales Portfolio'
+                        ],
+                        'Anzahl': [count_total, count_filtered, count_data, count_final]
+                    })
+
+                    # 3. Plotly Chart erstellen
+                    fig_funnel = px.funnel(
+                        df_funnel, 
+                        x='Anzahl', 
+                        y='Phase', 
+                        title='Selektionsprozess',
+                        color='Phase',
+                        # Farben: Grau (Markt), Gold (Filter), Blau (Daten), Grün (Portfolio)
+                        color_discrete_sequence=['#E0E0E0', '#FFD700', '#87CEEB', '#228B22'] 
+                    )
+                    
+                    fig_funnel.update_traces(textinfo="value+percent previous") 
+                    fig_funnel.update_layout(showlegend=False, height=400)
+
+                    # 4. Anzeige (Split Layout)
+                    c_fun1, c_fun2 = st.columns([2, 1])
+                    
+                    with c_fun1:
+                        st.plotly_chart(fig_funnel, use_container_width=True)
+                    
+                    with c_fun2:
+                        st.info("💡 **Analyse:**")
+                        
+                        # Berechnung Drop-Off
+                        if count_filtered > 0:
+                            drop_stage3 = 1 - (count_data / count_filtered)
+                        else:
+                            drop_stage3 = 0
+                        st.markdown(f"**Daten-Verfügbarkeitsverlust (Stage 2 → 3):** {drop_stage3:.4%}")
+                            
+                        # Selektionsquote (Markt -> Portfolio)
+                        if count_total > 0:
+                            selection_rate = count_final / count_total
+                            st.markdown(f"**Gesamt-Selektionsquote:** {selection_rate:.4%}")
+                        
+                        st.caption("Zeigt, wie selektiv der Algorithmus arbeitet.")
+                    
+                    st.divider()
+                    # ---------------------------------------------------------
+
+                    # ---------------------------------------------------------
+                    # DATEN-MERGE & VISUALISIERUNG
+                    # ---------------------------------------------------------
+
+                    # Merge mit Meta-Daten (Regionen & Sektoren) für Anzeige
+                    # WICHTIG: Hier 'TRBCBusinessSectorName' explizit mit auswählen!
+                    meta_cols = ['RegionofHeadquarters', 'TRBCBusinessSectorName', 'CountryofHeadquarters']
+                    
+                    # Wir holen Metadaten aus dem Descriptive File und entfernen Duplikate
+                    meta_clean = dfs["desc"].drop_duplicates('isin').set_index('isin')[meta_cols]
+                    
+                    # Left Join: Portfolio-Daten mit Metadaten anreichern
                     df_display = df_active.join(meta_clean, how='left')
                     
-                    # KPI Row
+                    # Fehlende Werte auffüllen (kosmetisch)
+                    df_display['RegionofHeadquarters'] = df_display['RegionofHeadquarters'].fillna('Unknown')
+                    df_display['TRBCBusinessSectorName'] = df_display['TRBCBusinessSectorName'].fillna('Other Sector')
+
+                    # KPI Row Anzeige
                     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
                     kpi1.metric("Anzahl Aktien", len(df_active))
                     kpi2.metric("Max Allokation", f"{df_active['Weight'].max():.2%}", df_active['Weight'].idxmax())
@@ -257,44 +344,63 @@ if all(df is not None for df in dfs.values()):
                     
                     st.markdown("---")
                     
-                    # 2. Charts & Tables (Layout 2 Spalten)
+                    # 2. Charts & Tables Area (Split Layout)
                     col_left, col_right = st.columns([1, 1])
                     
+                    # --- LINKE SPALTE: TOP 10 ---
                     with col_left:
                         st.subheader("🏆 Top 10 Positionen")
                         top10 = df_display.sort_values('Weight', ascending=False).head(10)
                         
-                        # Schöne Tabelle
+                        # Tabelle anzeigen (mit Sektor Info für mehr Details)
                         st.dataframe(
-                            top10[['Weight', 'RegionofHeadquarters', 'CountryofHeadquarters']].style.format({'Weight': '{:.2%}'}),
+                            top10[['Weight', 'TRBCBusinessSectorName', 'CountryofHeadquarters']].style.format({'Weight': '{:.2%}'}),
                             use_container_width=True
                         )
                         
-                        st.markdown(f"**Gesamtrendite (Exp.):** {perf[0]:.2%}")
-                        st.markdown(f"**Volatilität:** {perf[1]:.2%}")
+                        st.caption(f"Gesamtrendite (Exp.): {perf[0]:.2%} | Volatilität: {perf[1]:.2%}")
 
+                    # --- RECHTE SPALTE: STRUKTUR (TABS) ---
                     with col_right:
-                        st.subheader("🌍 Regionale Verteilung")
+                        st.subheader("📊 Portfolio Struktur")
                         
                         if not df_display.empty:
-                            # Group by Region
-                            df_region = df_display.groupby('RegionofHeadquarters')['Weight'].sum().reset_index()
+                            # Tabs für saubere Trennung
+                            tab_reg, tab_sec = st.tabs(["🌍 Regionen", "🏭 Sektoren"])
                             
-                            fig = px.pie(
-                                df_region, 
-                                values='Weight', 
-                                names='RegionofHeadquarters', 
-                                title='Allocation by Region',
-                                hole=0.4,
-                                color_discrete_sequence=px.colors.qualitative.Pastel
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
+                            # --- TAB 1: REGIONEN ---
+                            with tab_reg:
+                                df_region = df_display.groupby('RegionofHeadquarters')['Weight'].sum().reset_index()
+                                fig_reg = px.pie(
+                                    df_region, 
+                                    values='Weight', 
+                                    names='RegionofHeadquarters', 
+                                    hole=0.4,
+                                    color_discrete_sequence=px.colors.qualitative.Pastel
+                                )
+                                fig_reg.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+                                st.plotly_chart(fig_reg, use_container_width=True)
+
+                            # --- TAB 2: SEKTOREN ---
+                            with tab_sec:
+                                df_sector = df_display.groupby('TRBCBusinessSectorName')['Weight'].sum().reset_index()
+                                # Sortieren, damit die größten Sektoren oben stehen (für die Legende)
+                                df_sector = df_sector.sort_values('Weight', ascending=False)
+                                
+                                fig_sec = px.pie(
+                                    df_sector, 
+                                    values='Weight', 
+                                    names='TRBCBusinessSectorName', 
+                                    hole=0.4,
+                                    color_discrete_sequence=px.colors.qualitative.Set3 # Andere Farbpalette zur Unterscheidung
+                                )
+                                fig_sec.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+                                st.plotly_chart(fig_sec, use_container_width=True)
                         else:
-                            st.warning("Keine Positionen.")
+                            st.warning("Keine Positionen für Diagramme.")
 
                     # 3. Alle Positionen (Expander)
                     with st.expander("Vollständiges Portfolio ansehen"):
                         st.dataframe(df_display.sort_values('Weight', ascending=False).style.format({'Weight': '{:.4%}'}))
-
 else:
-    st.info("Bitte lade alle Dateien hoch oder platziere sie im 'data' Ordner.")
+    st.info("Bitte lade alle Dateien hoch oder platziere sie im 'data' Ordner (returns, desc, market).")
