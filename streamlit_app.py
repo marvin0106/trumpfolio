@@ -318,11 +318,10 @@ if all(df is not None for df in dfs.values()):
                     # ---------------------------------------------------------
 
                     # ---------------------------------------------------------
-                    # DATEN-MERGE & VISUALISIERUNG
+                    # DATEN-MERGE & VISUALISIERUNG (FIXED)
                     # ---------------------------------------------------------
 
                     # 1. Metadaten (Sektoren/Regionen) aus dem Filter-Datensatz (desc)
-                    # Hier holen wir uns Sektor & Region
                     meta_cols = ['RegionofHeadquarters', 'TRBCBusinessSectorName']
                     meta_clean = dfs["desc"].drop_duplicates('isin').set_index('isin')[meta_cols]
                     
@@ -334,7 +333,8 @@ if all(df is not None for df in dfs.values()):
                     df_display['Name'] = df_display.index.map(dfs["market"]['Name'])
                     
                     # Fallback: Wenn Name fehlt, nimm die ISIN
-                    df_display['Name'] = df_display['Name'].fillna(df_display.index)
+                    # FIX: .to_series() nutzen, da fillna keinen Index direkt akzeptiert
+                    df_display['Name'] = df_display['Name'].fillna(df_display.index.to_series())
                     
                     # Kosmetik für fehlende Werte
                     df_display['RegionofHeadquarters'] = df_display['RegionofHeadquarters'].fillna('Unknown')
@@ -362,12 +362,11 @@ if all(df is not None for df in dfs.values()):
                         st.subheader("🏆 Top 10 Positionen")
                         top10 = df_display.sort_values('Weight', ascending=False).head(10)
                         
-                        # Wir zeigen: Name, Gewicht, Sektor
                         cols_show = ['Name', 'Weight', 'TRBCBusinessSectorName']
                         
                         st.dataframe(
                             top10[cols_show].style.format({'Weight': '{:.2%}'}),
-                            use_container_width=True,
+                            use_container_width=True, # Falls Warnung bleibt: width="stretch" (je nach Version)
                             column_config={
                                 "Name": st.column_config.TextColumn("Aktie", width="medium"),
                                 "TRBCBusinessSectorName": st.column_config.TextColumn("Sektor"),
@@ -402,8 +401,15 @@ if all(df is not None for df in dfs.values()):
                         else:
                             st.warning("Keine Daten für Diagramme.")
 
-                    # 3. Alle Positionen (Expander)
+                    # 3. Alle Positionen (Als Dropdown; Ganz unten im Dashboard)
                     with st.expander("Vollständiges Portfolio ansehen"):
-                        st.dataframe(df_display.sort_values('Weight', ascending=False).style.format({'Weight': '{:.4%}'}))
+                        # Hier definieren wir die exakte Reihenfolge der Spalten
+                        cols_order = ['Name', 'Weight', 'RegionofHeadquarters', 'TRBCBusinessSectorName']
+                        
+                        # Wir wenden die Reihenfolge an (df_display[cols_order])
+                        st.dataframe(
+                            df_display[cols_order].sort_values('Weight', ascending=False).style.format({'Weight': '{:.4%}'}),
+                            use_container_width=True
+                        )
 else:
     st.info("Bitte lade alle Dateien hoch oder platziere sie im 'data' Ordner (returns, desc, market).")
