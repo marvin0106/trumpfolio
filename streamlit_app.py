@@ -188,23 +188,27 @@ def display_portfolio_column(title, emoji, strategy_color, weights, perf, df_des
         st.error(f"Optimierung fehlgeschlagen: {perf}")
         return
     
-    # DataFrame bauen
+    # 1. Daten aufbereiten
     df_w = pd.DataFrame.from_dict(weights, orient='index', columns=['Weight'])
     df_active = df_w[df_w['Weight'] > 0.0001].copy()
     
-    # Metadaten holen
+    # Metadaten holen (Sektor & Region)
     meta = df_desc.drop_duplicates('isin').set_index('isin')[['RegionofHeadquarters', 'TRBCBusinessSectorName']]
     df_show = df_active.join(meta, how='left')
 
     # --- FIX: Namen Mapping sicher machen ---
-    # 1. Erst mappen (das ergibt ein Index-Objekt oder Array)
+    # Schritt 1: Erst mappen (ergibt Index-Objekt)
     mapped_names = df_show.index.map(df_mkt['Name'])
-    # 2. Zuweisen (Pandas wandelt es jetzt sicher in eine Series innerhalb des DF um)
+    # Schritt 2: Zuweisen (Pandas macht daraus eine Series)
     df_show['Name'] = mapped_names
-    # 3. Jetzt fillna auf der Spalte aufrufen (Series akzeptiert Series als Füllwert)
+    # Schritt 3: fillna (jetzt sicher, da Series auf Series trifft)
     df_show['Name'] = df_show['Name'].fillna(df_show.index.to_series())
     
-    # KPIs
+    # Kosmetik für NaN Sektoren
+    df_show['RegionofHeadquarters'] = df_show['RegionofHeadquarters'].fillna('Unknown')
+    df_show['TRBCBusinessSectorName'] = df_show['TRBCBusinessSectorName'].fillna('Other Sector')
+    
+    # 2. KPIs
     c1, c2 = st.columns(2)
     c1.metric("Rendite (Erw.)", f"{perf[0]:.2%}")
     c2.metric("Volatilität", f"{perf[1]:.2%}")
@@ -213,26 +217,25 @@ def display_portfolio_column(title, emoji, strategy_color, weights, perf, df_des
     
     st.divider()
     
-    # Top 5 Tabelle
+    # 3. Top 5 Positionen (Kompakt)
     st.markdown("**Top 5 Positionen**")
     top5 = df_show.sort_values('Weight', ascending=False).head(5)
     
-    # Spalten explizit ordnen für saubere Anzeige
     st.dataframe(
         top5[['Name', 'Weight']],
         column_config={
-            "Name": st.column_config.TextColumn("Name", width="medium"), # 'medium' ist meist sicher, sonst weglassen
+            "Name": st.column_config.TextColumn("Name", width="medium"),
             "Weight": st.column_config.NumberColumn("Gewicht", format="%.2f %%")
         },
         use_container_width=True,
         hide_index=True
     )
     
-    # Sektor Chart
+    # 4. Sektor Chart
     st.markdown("**Sektoren**")
     grp = df_show.groupby('TRBCBusinessSectorName')['Weight'].sum().reset_index()
     
-    # Farbschema anpassen (Rot/Blau für Brown, Grün für Green)
+    # Farbschema: Rot/Blau für Brown, Grün-Töne für Green
     colors = px.colors.sequential.RdBu if strategy_color=='brown' else px.colors.sequential.Greens_r
     
     fig = px.pie(grp, values='Weight', names='TRBCBusinessSectorName', hole=0.5, 
@@ -240,7 +243,23 @@ def display_portfolio_column(title, emoji, strategy_color, weights, perf, df_des
     fig.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0), height=200)
     st.plotly_chart(fig, use_container_width=True)
 
-    return perf # Rückgabe der Performance für Vergleich
+    # 5. --- WIEDER DA: Vollständige Liste ---
+    with st.expander("📄 Alle Positionen anzeigen", expanded=False):
+        # Wir sortieren nach Gewichtung und zeigen relevante Spalten
+        cols_full = ['Name', 'Weight', 'RegionofHeadquarters', 'TRBCBusinessSectorName']
+        
+        st.dataframe(
+            df_show[cols_full].sort_values('Weight', ascending=False),
+            column_config={
+                "Name": st.column_config.TextColumn("Name"),
+                "Weight": st.column_config.NumberColumn("Gewicht", format="%.4f %%"), # 4 Nachkommastellen für Details
+                "RegionofHeadquarters": "Region",
+                "TRBCBusinessSectorName": "Sektor"
+            },
+            use_container_width=True
+        )
+
+    return perf # Rückgabe der Performance für den Vergleich
 
 # --- MAIN APP UI ---
 
